@@ -1,1 +1,9 @@
-streamlit
+# requirements.txt
+numpy>=1.23
+opencv-python>=4.8
+imutils>=0.5.4
+dlib>=19.24
+pygame>=2.5
+
+# Optional (helps if dlib needs to build from source on your machine)
+cmake>=3.20
