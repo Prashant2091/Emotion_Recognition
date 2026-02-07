@@ -1,350 +1,319 @@
+# Optimized + cleaned (same logic, way less CPU + no duplicate imshow + correct shutdown)
+# - Uses direct landmark indexing (no per-point if/elif jungle)
+# - Optional dlib correlation-tracker to avoid full face detection every frame
+# - Removes spammy prints (toggle DEBUG)
+# - Fixes: stopping the *actual* VideoStream (vs.stop()), not a new one
 
-# import the necessary packages
+import os
+import time
+import cv2
+import dlib
+import numpy as np
+import pygame
+import imutils
 from imutils.video import VideoStream
 from imutils import face_utils
 
-import pygame,dlib,time,cv2,os
-pygame.init()
+# =========================
+# CONFIG
+# =========================
+SHAPE_PREDICTOR = "shape_predictor_68_face_landmarks.dat"
+AUDIO_FILE = "Smile.mp3"
 
-shape_predictor="shape_predictor_68_face_landmarks.dat" 
-# initialize dlib's face detector (HOG-based) and then create
-# the facial landmark predictor
+CAM_SRC = 0
+RESIZE_WIDTH = 520          # lower = faster (e.g., 400–600)
+DETECT_EVERY = 7            # run HOG detector every N frames, track in-between
+TRACK_QUALITY_MIN = 6.5     # correlation tracker quality threshold
+
+DRAW_LANDMARKS = True       # set False for speed
+DRAW_INDEX = False          # True is slow
+DEBUG = False               # prints / verbose overlay
+
+HEAD_STILL_PX = 10
+
+# thresholds (kept close to your original)
+SMILE_BIG_JUMP = 15
+SMILE_SMOOTH_THR = 6
+SMILE_EVENT_MIN = 10
+SMILE_EVENT_MAX = 50
+
+EYE_BIG_JUMP = 2
+EYE_SMOOTH_THR = 1
+EYE_EVENT_MIN = 2.5
+EYE_EVENT_MAX = 5.0
+
+BROW_EVENT_THR = 3
+BOTH_EYES_SUM_MIN = 2
+BOTH_EYES_SUM_MAX = 4
+BOTH_EYES_BALANCE_THR = 0.5
+
+# landmark indices (0-based)
+MOUTH_L, MOUTH_R = 48, 54          # (49,55) in your 1-based counter
+L_EYE_T, L_EYE_B = 37, 40          # (38,41)
+R_EYE_T, R_EYE_B = 43, 46          # (44,47)
+BROW_PT = 19                        # (20)
+ANCHOR_PT = 0                       # (1)
+
+# =========================
+# Helpers
+# =========================
+def l2(a, b) -> float:
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    return float(np.linalg.norm(a - b))
+
+def pick_largest(rects):
+    return max(rects, key=lambda r: r.width() * r.height())
+
+def clamp_rect(rect, w, h):
+    l = max(0, rect.left())
+    t = max(0, rect.top())
+    r = min(w - 1, rect.right())
+    b = min(h - 1, rect.bottom())
+    if r <= l or b <= t:
+        return None
+    return dlib.rectangle(l, t, r, b)
+
+def update_baseline(base, curr, diff, big_jump_thr, smooth_thr):
+    if base is None or diff > big_jump_thr:
+        return curr
+    if diff < smooth_thr:
+        return 0.5 * (base + curr)
+    return base
+
+# =========================
+# Init
+# =========================
+cv2.setUseOptimized(True)
+
+if not os.path.exists(SHAPE_PREDICTOR):
+    raise FileNotFoundError(f"Missing predictor file: {SHAPE_PREDICTOR}")
+
 print("[INFO] loading facial landmark predictor...")
 detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(shape_predictor)
+predictor = dlib.shape_predictor(SHAPE_PREDICTOR)
 
-# initialize the video stream and allow the cammera sensor to warmup
+pygame.init()
+audio_ok = False
+try:
+    pygame.mixer.init()
+    if os.path.exists(AUDIO_FILE):
+        pygame.mixer.music.load(AUDIO_FILE)
+        audio_ok = True
+    else:
+        print(f"[WARN] Audio file not found: {AUDIO_FILE} (continuing without sound)")
+except Exception as e:
+    print(f"[WARN] pygame mixer init/load failed: {e} (continuing without sound)")
+
 print("[INFO] camera sensor warming up...")
-#vs = VideoStream(usePiCamera=args["picamera"] > 0).start()
-vs = VideoStream(src=0).start()
+vs = VideoStream(src=CAM_SRC).start()
+time.sleep(1.5)
 
-time.sleep(2.0)
+# dlib tracker (speed boost)
+tracker = dlib.correlation_tracker()
+tracking = False
+last_rect = None
 
-j=0
-p=[(0,0)]*68
-p1=[(0,0)]*68
-d=[(0,0)]*68
-dist_smilo=0
-dist_leyeo=0
-dist_reyeo=0
-dist_ango=0
-dup1,dup2=0,0
-diff_chx,diff_chy=0,0
-pid=0
-count_smile,count_eact,count_be=0,0,0
-# loop over the frames from the video stream
-while True:
-        # grab the frame from the threaded video stream, resize it to
-        # have a maximum width of 400 pixels, and convert it to
-        # grayscale
+# state / baselines
+base_smile = None
+base_leye = None
+base_reye = None
+
+prev_anchor = None
+prev_brow_rel = None
+
+count_smile = 0
+count_eact = 0
+count_be = 0
+
+frame_idx = 0
+t0 = time.perf_counter()
+fps = 0.0
+audio_playing = False
+
+cv2.namedWindow("Frame", cv2.WINDOW_NORMAL)
+
+try:
+    while True:
         frame = vs.read()
-        #frame = imutils.resize(frame, width=400)
+        if frame is None:
+            break
+
+        frame_idx += 1
+
+        # resize for speed + stable thresholds
+        frame = imutils.resize(frame, width=RESIZE_WIDTH)
+        h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # detect faces in the grayscale frame
-        rects = detector(gray, 0)
-        diff_smile=0
-        diff_ang=0
-        diff_leye=0
-        diff_eye=0
-        diff_reye=0
-        diff_up=0
-        diff_change=0
-        if j%2==0:
-                p=p1
-                p1=[(0,0)]*68
-                d=[(0,0)]*68
-        cv2.imshow("Frame", frame)
-        # loop over the face detections
-        x49=0
-        y49=0
-        x55=0
-        y55=0
-        x23=0
-        y23=0
-        x22=0
-        y22=0
-        x38=0
-        y38=0
-        x41=0
-        y41=0
-        x44=0
-        y44=0
-        x47=0
-        y47=0
-        print('count_eact,count_smile,count_be',count_eact,count_smile,count_be)
-        '''if count_eact>3:
-                pygame.mixer.music.load('Smile.mp3')
-                pygame.mixer.music.play(-1)
-                count_eact=0
-        elif count_smile>3:
-                pygame.mixer.music.stop()
-                count_smile=0'''
-        e,s,le,re,be=0,0,0,0,0
-        for rect in rects:
-                # determine the facial landmarks for the face region, then
-                # convert the facial landmark (x, y)-coordinates to a NumPy
-                # array
-                
+        # Decide rect: detect every N frames, track otherwise
+        rect = None
+        if (not tracking) or (frame_idx % DETECT_EVERY == 0):
+            rects = detector(gray, 0)
+            if len(rects) > 0:
+                rect = pick_largest(rects)
+                # start tracker on RGB
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                tracker.start_track(rgb, rect)
+                tracking = True
+            else:
+                tracking = False
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            q = tracker.update(rgb)
+            pos = tracker.get_position()
+            tr = dlib.rectangle(int(pos.left()), int(pos.top()), int(pos.right()), int(pos.bottom()))
+            tr = clamp_rect(tr, w, h)
+            if tr is None or q < TRACK_QUALITY_MIN:
+                tracking = False
+            else:
+                rect = tr
 
-                shape = predictor(gray, rect)
-                shape = face_utils.shape_to_np(shape)
+        action = None
+        e = s = be = le = re = 0
 
-                # loop over the (x, y)-coordinates for the facial landmarks
-                # and draw them on the image
-                i=1
-                print('iter'+str(j))
-                x1,y1,w,h=0,0,0,0
-                j=j+1
-                for (x, y) in shape:
-                        #print(i)
-                        cv2.circle(frame, (x, y), 1, (0, 0, 255), -1)
+        if rect is not None:
+            shape = predictor(gray, rect)
+            pts = face_utils.shape_to_np(shape)  # (68,2)
 
-                        #print(x,y)
-                        if(i):
-                                cv2.putText(frame, str(i), (x, y),cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
-                        #if j==1:
-                        if i==1:
-                                x1=x
-                                y1=y-40
-                                
-                                
-                                if j%2!=0:
-                                        dup1=x1
-                                        dup2=y1
-                                        #print('dup',dup1,dup2)
-                                        diff_chx,diff_chy=0,0
-                                else:
-                                        diff_chx=dup1-x1
-                                        #print(dup1)
-                                        
-                                        #print('change',diff_chx)
-                                        diff_chy=dup2-y1
-                                        #print(dup2)
-                                        
-                                        #print('change',diff_chy)
-                                
+            if DRAW_LANDMARKS:
+                for i, (x, y) in enumerate(pts):
+                    cv2.circle(frame, (int(x), int(y)), 1, (0, 0, 255), -1)
+                    if DRAW_INDEX:
+                        cv2.putText(frame, str(i + 1), (int(x), int(y)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
 
-                        elif i==9:
-                                h=y-y1
-                        elif i==17:
-                                w=x-x1
+            # anchor (matches your "y-40" trick)
+            anchor = (int(pts[ANCHOR_PT][0]), int(pts[ANCHOR_PT][1]) - 40)
+            head_dx = head_dy = 0
+            if prev_anchor is not None:
+                head_dx = abs(anchor[0] - prev_anchor[0])
+                head_dy = abs(anchor[1] - prev_anchor[1])
+            head_still = (prev_anchor is None) or (head_dx < HEAD_STILL_PX and head_dy < HEAD_STILL_PX)
 
-                        elif i==20:
-                                if j%2!=0:
-                                        y_20=y-y1
-                                        print(y_20)
-                                else:
-                                        y20=y-y1
-                                        diff_up=y_20-y20
-                                        print(y20,diff_up)
-                                        
-                                
-                        
-                        elif(i==49):
-                                x49=x
-                                y49=y
-                        elif(i==55):
-                                x55=x
-                                y55=y
+            # distances
+            smile = l2(pts[MOUTH_L], pts[MOUTH_R])
+            leye = l2(pts[L_EYE_T], pts[L_EYE_B])
+            reye = l2(pts[R_EYE_T], pts[R_EYE_B])
 
-                                dist_smile=((x49-x55)**2+(y49-y55)**2)**0.5
-                                print('dist-smile',dist_smile)
-                                diff_smile=(dist_smile)-dist_smilo
-                                if diff_smile<0:
-                                        diff_smile*=-1
+            # diffs vs baselines (computed BEFORE updating baselines)
+            diff_smile = 0.0 if base_smile is None else abs(smile - base_smile)
+            diff_leye = 0.0 if base_leye is None else abs(leye - base_leye)
+            diff_reye = 0.0 if base_reye is None else abs(reye - base_reye)
 
-                                print('diff-smile',diff_smile)
-                                
-                                print('dist-smilo',dist_smilo)
-                                if j==1 or diff_smile>15:
-                                        dist_smilo=dist_smile
-                                        
-                                        
-                                if diff_smile<6:
-                                        dist_smilo=(dist_smilo+dist_smile)//2
+            # brow movement (your diff_up logic)
+            brow_rel = int(pts[BROW_PT][1]) - anchor[1]  # (y20 - y1)
+            diff_up = 0
+            if prev_brow_rel is not None:
+                diff_up = prev_brow_rel - brow_rel  # (y_20 - y20)
+            # both-eye condition (kept close)
+            diff_eye = 0
+            if base_leye is not None and base_reye is not None:
+                balance = abs((reye - leye) - (base_reye - base_leye))
+                if (diff_leye + diff_reye > BOTH_EYES_SUM_MIN and
+                    diff_leye + diff_reye < BOTH_EYES_SUM_MAX and
+                    balance < BOTH_EYES_BALANCE_THR):
+                    diff_eye = 1
 
-                        elif(i==38):
-                                x38=x
-                                y38=y
-                        elif(i==41):
-                                x41=x
-                                y41=y
-                                dist_leye=((x38-x41)**2+(y38-y41)**2)**0.5
-                                print('dist-lefteye',dist_leye)
-                                diff_leye=(dist_leye)-dist_leyeo
+            # decision logic (same priority order)
+            if head_still:
+                if frame_idx > 1 and (diff_smile > SMILE_EVENT_MIN) and (diff_smile < SMILE_EVENT_MAX):
+                    action = "Smile"
+                    s = 1
+                elif diff_up > BROW_EVENT_THR:
+                    action = "eye act"
+                    e = 1
+                elif diff_eye == 1:
+                    action = "BothEye"
+                    be = 1
+                elif (diff_leye > EYE_EVENT_MIN) and (diff_leye < EYE_EVENT_MAX):
+                    action = "Reye"  # kept your original label (even though it's left-eye diff)
+                    le = 1
+                elif (diff_reye > EYE_EVENT_MIN) and (diff_reye < EYE_EVENT_MAX):
+                    action = "Leye"
+                    re = 1
 
-                                if diff_leye<0:
-                                        diff_leye=diff_leye*-1
+            # update baselines (same spirit as your code)
+            base_smile = update_baseline(base_smile, smile, diff_smile, SMILE_BIG_JUMP, SMILE_SMOOTH_THR)
+            base_leye  = update_baseline(base_leye,  leye,  diff_leye,  EYE_BIG_JUMP,   EYE_SMOOTH_THR)
+            base_reye  = update_baseline(base_reye,  reye,  diff_reye,  EYE_BIG_JUMP,   EYE_SMOOTH_THR)
 
-                                print('diff-leye',diff_leye)
-                                
-                                print('dist-leyeo',dist_leyeo)
-                                if j==1 or diff_leye>2:
-                                        dist_leyeo=dist_leye
-                                        
-                                        
-                                if diff_leye<1:
-                                        dist_leyeo=(dist_leyeo+dist_leye)//2                                
-                        elif(i==44):
-                                x44=x
-                                y44=y
-                        elif(i==47):
-                                x47=x
-                                y47=y
-                                dist_reye=((x44-x47)**2+(y44-y47)**2)**0.5
-                                print('dist-reye',dist_reye)
-                                diff_reye=(dist_reye)-dist_reyeo
+            # update prevs
+            prev_anchor = anchor
+            prev_brow_rel = brow_rel
 
-                                if diff_reye<0:
-                                        diff_reye=diff_reye*-1
+            # overlay
+            if action is not None:
+                cv2.putText(frame, action, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 255), 2)
+                if action == "Smile":
+                    cv2.imshow("selfie1", frame)
 
-                                print('diff-reye',diff_reye)
-                                
-                                print('dist-reyeo',dist_reyeo)
-                                if j==1 or diff_reye>2:
-                                        dist_reyeo=dist_reye
-                                print('check both')
-                                print(diff_leye,diff_reye)
-                                diff=(dist_reye-dist_leye)-(dist_reyeo-dist_leyeo)
-                                if diff<0:
-                                        diff=diff*-1
-                                if diff_leye+diff_reye>2 and diff_leye+diff_reye<4 and (diff<0.5):
-                                        print('check both')
-                                        diff_eye=1
-                                        
-                                '''if diff_leye>2.5 and diff_reye>2.5 and j!=1:
-                                        print('check both')
-                                        print(diff_leye,diff_reye)'''
-                                        
-                                if diff_reye<1:
-                                        dist_reyeo=(dist_reyeo+dist_reye)//2   
-        
-                        '''elif(i==22):
-                                x22=x
-                                y22=y
-                        elif(i==23):
-                                x23=x
-                                y23=y
-                                dist_ang=((x22-x23)**2+(y23-y23)**2)**0.5
-                                print('dist-ang',dist_ang)
-                                diff_ang=(dist_ang)-dist_ango
-                                if diff_ang<0:
-                                        diff_ang*=-1
+            # counters + audio behavior
+            if e:
+                count_eact += 1
+                if audio_ok and (not audio_playing):
+                    pygame.mixer.music.play(-1)
+                    audio_playing = True
+            else:
+                # stop audio if it was playing and eye-act is not active
+                if audio_ok and audio_playing and action in ("Leye", "Reye"):
+                    pygame.mixer.music.stop()
+                    audio_playing = False
 
-                                print('diff-ang',diff_ang)
-                                
-                                print('dist-ango',dist_ango)
-                                if j==1:
-                                        dist_ango=dist_ang
-                                        
-                                        
-                                if diff_ang<=5:
-                                        dist_ango=(dist_ango+dist_ang)//2'''
-                        #print('j',j)
-                        
-                       
-                        
-                        #cv2.rectangle(frame,(x1,y1),(x1+w,y1+h),(255,0,0),2)5
-                        if diff_chx<10 and diff_chy<10:
-                                
-                                if diff_smile>10 and diff_smile<50 and j!=1:
-                                        cv2.putText(frame,'Smile', (50, 50),cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 1)
-                                        s=1
-                                        cv2.imshow("selfie1", frame)
+            if s:
+                count_smile += 1
+            elif be:
+                count_be += 1
 
-                                elif diff_up>3:
-                                        cv2.putText(frame,'eye act', (50, 50),cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 1)
-                                        e=1
+            if DEBUG:
+                cv2.putText(frame,
+                            f"dx={head_dx} dy={head_dy}  dSmile={diff_smile:.1f} dL={diff_leye:.2f} dR={diff_reye:.2f} dUp={diff_up}",
+                            (30, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
-                                elif diff_eye==1: #2.5<diff_reye<5 and 2.5<diff_leye<5:
-                                        #cv2.putText(frame,'Botheye', (50, 50),cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 1)
-                                        print('Botheye')
-                                        be=1
+        else:
+            cv2.putText(frame, "No face", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+            tracking = False
 
-                                        #os.system("notepad")
-                                elif diff_leye>2.5 and diff_leye<5:
-                                        
-                                        pid=os.getpid()
-                                        print(pid)
-                                        
-                                        #cs=VideoStream(src=1).start()
-                                        cv2.putText(frame,'Reye', (50, 50),cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 1)
-                                        le=1
-                                        
-                                        #time.sleep(5.0)
-                                        #fr = cs.read()
-                                        #cv2.imshow("selfie1", frame)
-                                        #VideoStream(src=1).stop()
-                                        #os.kill(pid,signal.SIG_DFL)
+        # FPS + counters
+        t1 = time.perf_counter()
+        dt = t1 - t0
+        if dt >= 0.5:
+            fps = frame_idx / (t1 - (t1 - dt))  # lightweight-ish; not perfect but ok
+            t0 = t1
+            frame_idx = 0
 
-                                        '''capture = CaptureFromCAM(1)  # 0 -> index of camera
-                                        if capture:     # Camera initialized without any errors
-                                           NamedWindow("cam-test",CV_WINDOW_AUTOSIZE)
-                                           f = QueryFrame(capture)     # capture the frame
-                                           if f:
-                                               ShowImage("cam-test",f)
-                                               WaitKey(0)
-                                        
-                                        #vs = VideoStream(src=0).start()
-                                        frame = vs.read()
-                                        #DestroyWindow("cam-test")'''
-                                        '''pygame.camera.init()
-                                        cam = pygame.camera.Camera(pygame.camera.list_cameras()[0])
-                                        cam.start()
-                                        img = cam.get_image()
-                                        pygame.image.save(img, "photo.png")
-                                        pygame.camera.quit()'''
-                                                                                
-                                        '''elif diff_ang>4 and j!=1:
-                                                cv2.putText(frame,'Anger', (50, 50),cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 1)
-                                                #print('Anger')'''
-
-                                elif diff_reye>2.5 and diff_reye<5:
-                                        pygame.mixer.music.stop()
-                                        cv2.putText(frame,'Leye', (50, 50),cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 1)
-                                        re=1
-                                        #cv2.imshow("selfie2", frame)
-                                        
-                                        #time.sleep(5.0)
-                                        #fr = cs.read()
-                                        #cv2.imshow("selfie", fr)
-                                        #VideoStream(src=1).stop()  
-                        #if i==1:
-                        #        print(x,y)
-
-
-                        i=i+1
-
-        if e:
-                pygame.mixer.music.load('Smile.mp3')
-                pygame.mixer.music.play(-1)                
-                print('eye act')
-                count_eact=count_eact+1
-        elif s:
-                print('smile')
-                count_smile=count_smile+1
-        # show the frame
-        elif be:
-                print('Bothe')
-                count_be=count_be+1
-        elif le:
-                h=1
-                #os.startfile('chrome')
-                #os.system("%systemroot%\system32\scrnsave.scr /s")
-                #exit()
+        cv2.putText(frame, f"Smile:{count_smile}  EyeAct:{count_eact}  BothEye:{count_be}",
+                    (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         cv2.imshow("Frame", frame)
-       
         key = cv2.waitKey(1) & 0xFF
-        #if j==15:
-        #        break
-        # if the `q` key was pressed, break from the loop
+
         if key == ord("q"):
-                break
- 
-# do a bit of cleanup
-VideoStream(src=0).stop()
-cv2.destroyAllWindows()
+            break
+        elif key == ord("l"):
+            DRAW_LANDMARKS = not DRAW_LANDMARKS
+        elif key == ord("i"):
+            DRAW_INDEX = not DRAW_INDEX
+        elif key == ord("d"):
+            DEBUG = not DEBUG
+        elif key == ord("r"):
+            base_smile = base_leye = base_reye = None
+            prev_anchor = None
+            prev_brow_rel = None
+            tracking = False
 
+finally:
+    # clean shutdown
+    try:
+        if audio_ok:
+            pygame.mixer.music.stop()
+    except Exception:
+        pass
+    pygame.quit()
 
+    try:
+        vs.stop()  # IMPORTANT: stop the existing stream
+    except Exception:
+        pass
+
+    cv2.destroyAllWindows()
