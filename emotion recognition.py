@@ -1,52 +1,88 @@
-# Optimized + cleaned (same logic, way less CPU + no duplicate imshow + correct shutdown)
-# - Uses direct landmark indexing (no per-point if/elif jungle)
-# - Optional dlib correlation-tracker to avoid full face detection every frame
-# - Removes spammy prints (toggle DEBUG)
-# - Fixes: stopping the *actual* VideoStream (vs.stop()), not a new one
-
+import base64
+import bz2
 import os
 import time
+import threading
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any
+
+import av
 import cv2
 import dlib
-import numpy as np
-import pygame
 import imutils
-from imutils.video import VideoStream
+import numpy as np
+import streamlit as st
+import streamlit.components.v1 as components
 from imutils import face_utils
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
 # =========================
-# CONFIG
+# Model download (auto)
 # =========================
-SHAPE_PREDICTOR = "shape_predictor_68_face_landmarks.dat"
-AUDIO_FILE = "Smile.mp3"
+MODEL_URLS = [
+    "https://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2",
+    "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2",
+]
 
-CAM_SRC = 0
-RESIZE_WIDTH = 520          # lower = faster (e.g., 400–600)
-DETECT_EVERY = 7            # run HOG detector every N frames, track in-between
-TRACK_QUALITY_MIN = 6.5     # correlation tracker quality threshold
+CACHE_DIR = Path.home() / ".cache" / "dlib_models"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+PRED_DAT = CACHE_DIR / "shape_predictor_68_face_landmarks.dat"
+PRED_BZ2 = CACHE_DIR / "shape_predictor_68_face_landmarks.dat.bz2"
 
-DRAW_LANDMARKS = True       # set False for speed
-DRAW_INDEX = False          # True is slow
-DEBUG = False               # prints / verbose overlay
 
-HEAD_STILL_PX = 10
+def _download_file(url: str, dst: Path) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(dst, "wb") as f:
+        while True:
+            chunk = r.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
 
-# thresholds (kept close to your original)
-SMILE_BIG_JUMP = 15
-SMILE_SMOOTH_THR = 6
-SMILE_EVENT_MIN = 10
-SMILE_EVENT_MAX = 50
 
-EYE_BIG_JUMP = 2
-EYE_SMOOTH_THR = 1
-EYE_EVENT_MIN = 2.5
-EYE_EVENT_MAX = 5.0
+def _decompress_bz2(src_bz2: Path, dst_dat: Path) -> None:
+    with bz2.open(src_bz2, "rb") as f_in, open(dst_dat, "wb") as f_out:
+        while True:
+            chunk = f_in.read(1024 * 1024)
+            if not chunk:
+                break
+            f_out.write(chunk)
 
-BROW_EVENT_THR = 3
-BOTH_EYES_SUM_MIN = 2
-BOTH_EYES_SUM_MAX = 4
-BOTH_EYES_BALANCE_THR = 0.5
 
+@st.cache_resource(show_spinner=False)
+def ensure_predictor() -> str:
+    if PRED_DAT.exists():
+        return str(PRED_DAT)
+
+    # download bz2
+    last_err = None
+    for url in MODEL_URLS:
+        try:
+            _download_file(url, PRED_BZ2)
+            _decompress_bz2(PRED_BZ2, PRED_DAT)
+            try:
+                PRED_BZ2.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return str(PRED_DAT)
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Failed to download predictor. Last error: {last_err}")
+
+
+@st.cache_resource(show_spinner=False)
+def load_models(predictor_path: str):
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor(predictor_path)
+    return detector, predictor
+
+
+# =========================
+# Detection config
+# =========================
 # landmark indices (0-based)
 MOUTH_L, MOUTH_R = 48, 54          # (49,55) in your 1-based counter
 L_EYE_T, L_EYE_B = 37, 40          # (38,41)
@@ -54,18 +90,14 @@ R_EYE_T, R_EYE_B = 43, 46          # (44,47)
 BROW_PT = 19                        # (20)
 ANCHOR_PT = 0                       # (1)
 
-# =========================
-# Helpers
-# =========================
+
 def l2(a, b) -> float:
     a = np.asarray(a, dtype=np.float32)
     b = np.asarray(b, dtype=np.float32)
     return float(np.linalg.norm(a - b))
 
-def pick_largest(rects):
-    return max(rects, key=lambda r: r.width() * r.height())
 
-def clamp_rect(rect, w, h):
+def clamp_rect(rect: dlib.rectangle, w: int, h: int) -> Optional[dlib.rectangle]:
     l = max(0, rect.left())
     t = max(0, rect.top())
     r = min(w - 1, rect.right())
@@ -74,246 +106,319 @@ def clamp_rect(rect, w, h):
         return None
     return dlib.rectangle(l, t, r, b)
 
-def update_baseline(base, curr, diff, big_jump_thr, smooth_thr):
+
+def update_baseline(base: Optional[float], curr: float, diff: float, big_jump_thr: float, smooth_thr: float) -> float:
     if base is None or diff > big_jump_thr:
         return curr
     if diff < smooth_thr:
         return 0.5 * (base + curr)
     return base
 
+
+@dataclass
+class Cfg:
+    resize_width: int = 520
+    detect_every: int = 7
+    track_quality_min: float = 6.5
+
+    draw_landmarks: bool = True
+    draw_index: bool = False
+    draw_bbox: bool = True
+    debug: bool = False
+
+    head_still_px: int = 10
+    anchor_y_offset: int = 40
+
+    smile_big_jump: float = 15
+    smile_smooth: float = 6
+    smile_event_min: float = 10
+    smile_event_max: float = 50
+
+    eye_big_jump: float = 2
+    eye_smooth: float = 1
+    eye_event_min: float = 2.5
+    eye_event_max: float = 5.0
+
+    brow_event_thr: float = 3
+    both_sum_min: float = 2
+    both_sum_max: float = 4
+    both_balance_thr: float = 0.5
+
+    event_cooldown_s: float = 0.8
+
+
 # =========================
-# Init
+# Video Processor
 # =========================
-cv2.setUseOptimized(True)
+class GestureProcessor(VideoProcessorBase):
+    def __init__(self, detector, predictor, cfg: Cfg):
+        self.detector = detector
+        self.predictor = predictor
+        self.cfg = cfg
 
-if not os.path.exists(SHAPE_PREDICTOR):
-    raise FileNotFoundError(f"Missing predictor file: {SHAPE_PREDICTOR}")
+        self.tracker = dlib.correlation_tracker()
+        self.tracking = False
+        self.frame_i = 0
 
-print("[INFO] loading facial landmark predictor...")
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(SHAPE_PREDICTOR)
+        self.base_smile: Optional[float] = None
+        self.base_leye: Optional[float] = None
+        self.base_reye: Optional[float] = None
 
-pygame.init()
-audio_ok = False
-try:
-    pygame.mixer.init()
-    if os.path.exists(AUDIO_FILE):
-        pygame.mixer.music.load(AUDIO_FILE)
-        audio_ok = True
-    else:
-        print(f"[WARN] Audio file not found: {AUDIO_FILE} (continuing without sound)")
-except Exception as e:
-    print(f"[WARN] pygame mixer init/load failed: {e} (continuing without sound)")
+        self.prev_anchor: Optional[Tuple[int, int]] = None
+        self.prev_brow_rel: Optional[int] = None
 
-print("[INFO] camera sensor warming up...")
-vs = VideoStream(src=CAM_SRC).start()
-time.sleep(1.5)
+        self._last_emit_ts = 0.0
 
-# dlib tracker (speed boost)
-tracker = dlib.correlation_tracker()
-tracking = False
-last_rect = None
+        self._lock = threading.Lock()
+        self._event_id = 0
+        self._last_event: Optional[str] = None
+        self._counts = {"smile": 0, "eyeact": 0, "both": 0, "leye": 0, "reye": 0}
 
-# state / baselines
-base_smile = None
-base_leye = None
-base_reye = None
+    def _emit(self, event: str):
+        now = time.time()
+        if (now - self._last_emit_ts) < self.cfg.event_cooldown_s:
+            return
+        self._last_emit_ts = now
 
-prev_anchor = None
-prev_brow_rel = None
+        with self._lock:
+            self._last_event = event
+            self._event_id += 1
+            if event == "Smile":
+                self._counts["smile"] += 1
+            elif event == "eye act":
+                self._counts["eyeact"] += 1
+            elif event == "BothEye":
+                self._counts["both"] += 1
+            elif event == "Leye":
+                self._counts["leye"] += 1
+            elif event == "Reye":
+                self._counts["reye"] += 1
 
-count_smile = 0
-count_eact = 0
-count_be = 0
+    def get_state(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "event_id": self._event_id,
+                "last_event": self._last_event,
+                "counts": dict(self._counts),
+            }
 
-frame_idx = 0
-t0 = time.perf_counter()
-fps = 0.0
-audio_playing = False
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
 
-cv2.namedWindow("Frame", cv2.WINDOW_NORMAL)
+        # resize for speed
+        if self.cfg.resize_width and img.shape[1] > self.cfg.resize_width:
+            img = imutils.resize(img, width=self.cfg.resize_width)
 
-try:
-    while True:
-        frame = vs.read()
-        if frame is None:
-            break
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        self.frame_i += 1
 
-        frame_idx += 1
-
-        # resize for speed + stable thresholds
-        frame = imutils.resize(frame, width=RESIZE_WIDTH)
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Decide rect: detect every N frames, track otherwise
         rect = None
-        if (not tracking) or (frame_idx % DETECT_EVERY == 0):
-            rects = detector(gray, 0)
-            if len(rects) > 0:
-                rect = pick_largest(rects)
-                # start tracker on RGB
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                tracker.start_track(rgb, rect)
-                tracking = True
+
+        # detect every N frames; track in-between
+        if (not self.tracking) or (self.frame_i % self.cfg.detect_every == 0):
+            rects = self.detector(gray, 0)
+            if rects:
+                rect = max(rects, key=lambda r: r.width() * r.height())
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                self.tracker.start_track(rgb, rect)
+                self.tracking = True
             else:
-                tracking = False
+                self.tracking = False
         else:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            q = tracker.update(rgb)
-            pos = tracker.get_position()
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            q = self.tracker.update(rgb)
+            pos = self.tracker.get_position()
             tr = dlib.rectangle(int(pos.left()), int(pos.top()), int(pos.right()), int(pos.bottom()))
             tr = clamp_rect(tr, w, h)
-            if tr is None or q < TRACK_QUALITY_MIN:
-                tracking = False
+            if tr is None or q < self.cfg.track_quality_min:
+                self.tracking = False
             else:
                 rect = tr
 
-        action = None
-        e = s = be = le = re = 0
+        if rect is None:
+            cv2.putText(img, "No face", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        if rect is not None:
-            shape = predictor(gray, rect)
-            pts = face_utils.shape_to_np(shape)  # (68,2)
+        if self.cfg.draw_bbox:
+            cv2.rectangle(img, (rect.left(), rect.top()), (rect.right(), rect.bottom()), (0, 255, 0), 2)
 
-            if DRAW_LANDMARKS:
-                for i, (x, y) in enumerate(pts):
-                    cv2.circle(frame, (int(x), int(y)), 1, (0, 0, 255), -1)
-                    if DRAW_INDEX:
-                        cv2.putText(frame, str(i + 1), (int(x), int(y)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
+        shape = self.predictor(gray, rect)
+        pts = face_utils.shape_to_np(shape)
 
-            # anchor (matches your "y-40" trick)
-            anchor = (int(pts[ANCHOR_PT][0]), int(pts[ANCHOR_PT][1]) - 40)
-            head_dx = head_dy = 0
-            if prev_anchor is not None:
-                head_dx = abs(anchor[0] - prev_anchor[0])
-                head_dy = abs(anchor[1] - prev_anchor[1])
-            head_still = (prev_anchor is None) or (head_dx < HEAD_STILL_PX and head_dy < HEAD_STILL_PX)
+        if self.cfg.draw_landmarks:
+            for i, (x, y) in enumerate(pts):
+                cv2.circle(img, (int(x), int(y)), 1, (0, 0, 255), -1)
+                if self.cfg.draw_index:
+                    cv2.putText(img, str(i + 1), (int(x), int(y)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
 
-            # distances
-            smile = l2(pts[MOUTH_L], pts[MOUTH_R])
-            leye = l2(pts[L_EYE_T], pts[L_EYE_B])
-            reye = l2(pts[R_EYE_T], pts[R_EYE_B])
+        # anchor (your y-40 trick)
+        anchor_base = pts[ANCHOR_PT]
+        anchor = (int(anchor_base[0]), int(anchor_base[1]) - self.cfg.anchor_y_offset)
 
-            # diffs vs baselines (computed BEFORE updating baselines)
-            diff_smile = 0.0 if base_smile is None else abs(smile - base_smile)
-            diff_leye = 0.0 if base_leye is None else abs(leye - base_leye)
-            diff_reye = 0.0 if base_reye is None else abs(reye - base_reye)
+        head_dx = head_dy = 0
+        if self.prev_anchor is not None:
+            head_dx = abs(anchor[0] - self.prev_anchor[0])
+            head_dy = abs(anchor[1] - self.prev_anchor[1])
+        head_still = (self.prev_anchor is None) or (head_dx < self.cfg.head_still_px and head_dy < self.cfg.head_still_px)
 
-            # brow movement (your diff_up logic)
-            brow_rel = int(pts[BROW_PT][1]) - anchor[1]  # (y20 - y1)
-            diff_up = 0
-            if prev_brow_rel is not None:
-                diff_up = prev_brow_rel - brow_rel  # (y_20 - y20)
-            # both-eye condition (kept close)
-            diff_eye = 0
-            if base_leye is not None and base_reye is not None:
-                balance = abs((reye - leye) - (base_reye - base_leye))
-                if (diff_leye + diff_reye > BOTH_EYES_SUM_MIN and
-                    diff_leye + diff_reye < BOTH_EYES_SUM_MAX and
-                    balance < BOTH_EYES_BALANCE_THR):
-                    diff_eye = 1
+        # distances
+        smile = l2(pts[MOUTH_L], pts[MOUTH_R])
+        leye = l2(pts[L_EYE_T], pts[L_EYE_B])
+        reye = l2(pts[R_EYE_T], pts[R_EYE_B])
 
-            # decision logic (same priority order)
-            if head_still:
-                if frame_idx > 1 and (diff_smile > SMILE_EVENT_MIN) and (diff_smile < SMILE_EVENT_MAX):
-                    action = "Smile"
-                    s = 1
-                elif diff_up > BROW_EVENT_THR:
-                    action = "eye act"
-                    e = 1
-                elif diff_eye == 1:
-                    action = "BothEye"
-                    be = 1
-                elif (diff_leye > EYE_EVENT_MIN) and (diff_leye < EYE_EVENT_MAX):
-                    action = "Reye"  # kept your original label (even though it's left-eye diff)
-                    le = 1
-                elif (diff_reye > EYE_EVENT_MIN) and (diff_reye < EYE_EVENT_MAX):
-                    action = "Leye"
-                    re = 1
+        diff_smile = 0.0 if self.base_smile is None else abs(smile - self.base_smile)
+        diff_leye = 0.0 if self.base_leye is None else abs(leye - self.base_leye)
+        diff_reye = 0.0 if self.base_reye is None else abs(reye - self.base_reye)
 
-            # update baselines (same spirit as your code)
-            base_smile = update_baseline(base_smile, smile, diff_smile, SMILE_BIG_JUMP, SMILE_SMOOTH_THR)
-            base_leye  = update_baseline(base_leye,  leye,  diff_leye,  EYE_BIG_JUMP,   EYE_SMOOTH_THR)
-            base_reye  = update_baseline(base_reye,  reye,  diff_reye,  EYE_BIG_JUMP,   EYE_SMOOTH_THR)
+        # brow movement (your diff_up logic)
+        brow_rel = int(pts[BROW_PT][1]) - anchor[1]
+        diff_up = 0
+        if self.prev_brow_rel is not None:
+            diff_up = self.prev_brow_rel - brow_rel
 
-            # update prevs
-            prev_anchor = anchor
-            prev_brow_rel = brow_rel
+        # both-eye check (kept close to your logic)
+        diff_eye = 0
+        if self.base_leye is not None and self.base_reye is not None:
+            balance = abs((reye - leye) - (self.base_reye - self.base_leye))
+            if (diff_leye + diff_reye > self.cfg.both_sum_min and
+                diff_leye + diff_reye < self.cfg.both_sum_max and
+                balance < self.cfg.both_balance_thr):
+                diff_eye = 1
 
-            # overlay
-            if action is not None:
-                cv2.putText(frame, action, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 255), 2)
-                if action == "Smile":
-                    cv2.imshow("selfie1", frame)
+        event = None
+        if head_still:
+            if self.frame_i > 1 and (diff_smile > self.cfg.smile_event_min) and (diff_smile < self.cfg.smile_event_max):
+                event = "Smile"
+            elif diff_up > self.cfg.brow_event_thr:
+                event = "eye act"
+            elif diff_eye == 1:
+                event = "BothEye"
+            elif (diff_leye > self.cfg.eye_event_min) and (diff_leye < self.cfg.eye_event_max):
+                event = "Reye"
+            elif (diff_reye > self.cfg.eye_event_min) and (diff_reye < self.cfg.eye_event_max):
+                event = "Leye"
 
-            # counters + audio behavior
-            if e:
-                count_eact += 1
-                if audio_ok and (not audio_playing):
-                    pygame.mixer.music.play(-1)
-                    audio_playing = True
-            else:
-                # stop audio if it was playing and eye-act is not active
-                if audio_ok and audio_playing and action in ("Leye", "Reye"):
-                    pygame.mixer.music.stop()
-                    audio_playing = False
+        if event:
+            self._emit(event)
+            cv2.putText(img, event, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 255), 2)
 
-            if s:
-                count_smile += 1
-            elif be:
-                count_be += 1
+        # update baselines
+        self.base_smile = update_baseline(self.base_smile, smile, diff_smile, self.cfg.smile_big_jump, self.cfg.smile_smooth)
+        self.base_leye = update_baseline(self.base_leye, leye, diff_leye, self.cfg.eye_big_jump, self.cfg.eye_smooth)
+        self.base_reye = update_baseline(self.base_reye, reye, diff_reye, self.cfg.eye_big_jump, self.cfg.eye_smooth)
 
-            if DEBUG:
-                cv2.putText(frame,
-                            f"dx={head_dx} dy={head_dy}  dSmile={diff_smile:.1f} dL={diff_leye:.2f} dR={diff_reye:.2f} dUp={diff_up}",
-                            (30, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        self.prev_anchor = anchor
+        self.prev_brow_rel = brow_rel
 
-        else:
-            cv2.putText(frame, "No face", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
-            tracking = False
+        if self.cfg.debug:
+            cv2.putText(
+                img,
+                f"dx={head_dx} dy={head_dy} dSmile={diff_smile:.1f} dL={diff_leye:.2f} dR={diff_reye:.2f} dUp={diff_up}",
+                (30, h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                1,
+            )
 
-        # FPS + counters
-        t1 = time.perf_counter()
-        dt = t1 - t0
-        if dt >= 0.5:
-            fps = frame_idx / (t1 - (t1 - dt))  # lightweight-ish; not perfect but ok
-            t0 = t1
-            frame_idx = 0
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        cv2.putText(frame, f"Smile:{count_smile}  EyeAct:{count_eact}  BothEye:{count_be}",
-                    (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        cv2.imshow("Frame", frame)
-        key = cv2.waitKey(1) & 0xFF
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Face Gesture Detector", layout="wide")
+st.title("Face Gesture Detector (Streamlit Cloud / WebRTC)")
 
-        if key == ord("q"):
-            break
-        elif key == ord("l"):
-            DRAW_LANDMARKS = not DRAW_LANDMARKS
-        elif key == ord("i"):
-            DRAW_INDEX = not DRAW_INDEX
-        elif key == ord("d"):
-            DEBUG = not DEBUG
-        elif key == ord("r"):
-            base_smile = base_leye = base_reye = None
-            prev_anchor = None
-            prev_brow_rel = None
-            tracking = False
+with st.sidebar:
+    st.subheader("Performance")
+    resize_width = st.slider("Resize width", 320, 960, 520, 20)
+    detect_every = st.slider("Detect every N frames (tracking in-between)", 2, 20, 7, 1)
 
-finally:
-    # clean shutdown
-    try:
-        if audio_ok:
-            pygame.mixer.music.stop()
-    except Exception:
-        pass
-    pygame.quit()
+    st.subheader("Overlays")
+    draw_landmarks = st.checkbox("Draw landmarks", True)
+    draw_index = st.checkbox("Draw landmark indices (slow)", False)
+    draw_bbox = st.checkbox("Draw face box", True)
+    debug = st.checkbox("Debug text", False)
 
-    try:
-        vs.stop()  # IMPORTANT: stop the existing stream
-    except Exception:
-        pass
+    st.subheader("Events")
+    play_sound = st.checkbox("Play sound on event (browser)", False)
+    sound_file = st.text_input("Sound file (in repo)", "Smile.mp3")
 
-    cv2.destroyAllWindows()
+cfg = Cfg(
+    resize_width=resize_width,
+    detect_every=detect_every,
+    draw_landmarks=draw_landmarks,
+    draw_index=draw_index,
+    draw_bbox=draw_bbox,
+    debug=debug,
+)
+
+# predictor + models
+with st.spinner("Preparing dlib model (first run may download ~60MB + decompress)..."):
+    predictor_path = ensure_predictor()
+detector, predictor = load_models(predictor_path)
+
+audio_b64 = None
+if play_sound:
+    p = Path(sound_file)
+    if p.exists():
+        audio_b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+    else:
+        st.sidebar.warning(f"Sound file not found: {sound_file}")
+
+rtc_configuration = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+col1, col2 = st.columns([2, 1], vertical_alignment="top")
+
+with col1:
+    ctx = webrtc_streamer(
+        key="cam",
+        rtc_configuration=rtc_configuration,
+        video_processor_factory=lambda: GestureProcessor(detector, predictor, cfg),
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+with col2:
+    st.subheader("Live Events")
+    status_ph = st.empty()
+    counts_ph = st.empty()
+    sound_ph = st.empty()
+
+    seen_id = -1
+
+    # Live update loop (only while playing)
+    while ctx.state.playing:
+        vp = ctx.video_processor
+        if vp is None:
+            time.sleep(0.1)
+            continue
+
+        state = vp.get_state()
+        counts_ph.json(state["counts"])
+
+        eid = state["event_id"]
+        ev = state["last_event"]
+
+        if eid != seen_id and ev:
+            seen_id = eid
+            status_ph.success(f"Detected: {ev}")
+
+            # Try to autoplay sound (browser may block autoplay depending on settings)
+            if play_sound and audio_b64:
+                sound_ph.empty()
+                components.html(
+                    f"""
+                    <audio autoplay>
+                      <source src="data:audio/mpeg;base64,{audio_b64}" type="audio/mpeg">
+                    </audio>
+                    """,
+                    height=0,
+                )
+
+        time.sleep(0.15)
