@@ -1,1 +1,7 @@
-
+streamlit
+streamlit-webrtc>=0.47
+opencv-python-headless>=4.8
+imutils>=0.5.4
+numpy>=1.23
+av>=11.0.0
+dlib==19.24.2
